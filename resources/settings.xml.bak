@@ -1,0 +1,21 @@
+<settings>
+    <category label="Playlists M3U">
+        <setting id="video_m3u_url" type="text"
+                 label="URL ou chemin du M3U video (le meme que dans IPTV Simple Client)"
+                 default=""/>
+        <setting id="audio_m3u_url" type="text"
+                 label="URL ou chemin du M3U audio (commentaires)"
+                 default=""/>
+    </category>
+    <category label="ffmpeg (Entware)">
+        <setting id="ffmpeg_path" type="text"
+                 label="Chemin de l'executable ffmpeg"
+                 default="/opt/bin/ffmpeg"/>
+        <setting id="http_port" type="number"
+                 label="Port local pour le flux fusionne"
+                 default="5588"/>
+        <setting id="user_agent" type="text"
+                 label="User-Agent HTTP (laisser vide si inconnu)"
+                 default=""/>
+    </category>
+</settings>

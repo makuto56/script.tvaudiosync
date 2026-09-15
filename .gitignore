@@ -1,0 +1,8 @@
+*.pyo
+*.pyc
+__pycache__/
+*.log
+*.pid
+*.tmp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<settings>
+    <category label="Playlists">
+        <setting id="video_m3u" type="file"
+                 label="Fichier M3U des chaines TV"
+                 mask="*.m3u|*.m3u8"
+                 default=""/>
+        <setting id="audio_m3u" type="file"
+                 label="Fichier M3U des commentaires audio"
+                 mask="*.m3u|*.m3u8"
+                 default=""/>
+    </category>
+    <category label="ffmpeg">
+        <setting id="ffmpeg_path" type="text"
+                 label="Chemin de ffmpeg"
+                 default="/opt/bin/ffmpeg"/>
+        <setting id="http_port" type="number"
+                 label="Port local (5588 par defaut)"
+                 default="5588"/>
+        <setting id="user_agent" type="text"
+                 label="User-Agent HTTP (laisser vide si inconnu)"
+                 default=""/>
+    </category>
+</settings>
