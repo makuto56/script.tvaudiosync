@@ -3,6 +3,7 @@ import os
 import json
 import time
 import threading
+import socket
 
 try:
     from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -305,7 +306,7 @@ def start_server(command_queue, presets_file, log_file, channels, audios, prefer
             t.daemon = True
             t.start()
             return _SERVER
-        except OSError as exc:
+        except socket.error as exc:
             _SERVER = None
             try:
                 import xbmc
@@ -313,6 +314,7 @@ def start_server(command_queue, presets_file, log_file, channels, audios, prefer
             except Exception:
                 pass
     WEB_ACTUAL_PORT = 0
+    update_state(web_port=0)
     return None
 
 
