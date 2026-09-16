@@ -4,14 +4,9 @@
 
 # TV Audio Sync — Addon Kodi
 
-Fusionne en direct, via **ffmpeg**, la vidéo d'une chaîne TV IPTV avec un flux
-audio externe (commentaire sportif, radio, etc.) choisi dans une seconde
-playlist M3U.
+Fusionne en direct, via **ffmpeg**, la vidéo d'une chaîne TV IPTV avec un flux audio externe (commentaire sportif, radio, etc.) choisi dans une seconde playlist M3U.
 
-Kodi ne peut pas lire deux flux en parallèle. Cet addon contourne la limite en
-demandant à `ffmpeg` de coller la vidéo et l'audio en un **seul flux local**,
-que Kodi lit ensuite normalement. Résultat : image et son parfaitement
-synchronisés, sans coupure.
+Kodi ne lit normalement pas deux flux indépendants pour cette utilisation. L'addon demande donc à **ffmpeg** de produire un flux MPEG-TS local contenant la vidéo et l'audio externe, puis Kodi lit ce flux unique.
 
 ## Fonctionnalités
 
@@ -19,17 +14,21 @@ synchronisés, sans coupure.
 - Décalage audio réglable en direct (±100 / ±500 ms)
 - Volume du commentaire ajustable (0–200 %)
 - Changement de chaîne / d'audio en direct
-- Presets : sauvegardez vos combinaisons préférées
-- Interface web complète (port 8090)
-- Statistiques système (CPU, RAM, température)
+- Presets avec identifiant stable
+- Interface web de contrôle
+- Authentification par jeton généré automatiquement si aucun jeton n'est configuré
+- Fallback automatique du port web si 8090 est déjà utilisé par Kodi ou un autre service
+- Fallback automatique du port ffmpeg si le port configuré est occupé
+- Affichage du PID et du port ffmpeg dans l'interface
 - Logs ffmpeg consultables depuis le navigateur
-- Reconnexion automatique si ffmpeg plante
+- Reconnexion automatique si ffmpeg s'arrête
+- Compatible Kodi 18 / Python 2.7 tout en restant préparé pour les versions plus récentes
 
 ## Prérequis
 
 - Kodi 18 (Leia) ou supérieur
 - Box sous CoreELEC, LibreELEC ou Linux
-- ffmpeg installé (via Entware sur CoreELEC)
+- ffmpeg installé (par exemple via Entware sur CoreELEC)
 - IPTV Simple Client configuré avec un M3U vidéo
 - Un second M3U pour les flux audio
 
@@ -43,12 +42,15 @@ En SSH sur la box :
     # La box redémarre
     opkg update
     opkg install ffmpeg
-    which ffmpeg    # doit renvoyer /opt/bin/ffmpeg
+    which ffmpeg
+
+Le chemin par défaut de l'addon est `/opt/bin/ffmpeg`.
 
 ### 2. Installer l'addon
 
-Téléchargez le zip depuis les Releases, puis dans Kodi :
-Extensions → icône dossier ouvert → sélectionnez le zip.
+Téléchargez le ZIP de la release puis, dans Kodi :
+
+Extensions → icône dossier ouvert → installer depuis un fichier ZIP.
 
 ### 3. Configurer
 
@@ -56,65 +58,91 @@ Kodi → Extensions → Mes extensions → Programmes → TV Audio Sync → Conf
 
 - Fichier M3U des chaînes TV : le même que dans IPTV Simple Client
 - Fichier M3U des commentaires audio : votre playlist audio
-- Chemin de ffmpeg : /opt/bin/ffmpeg
-- Port local : 5589
+- Chemin de ffmpeg : `/opt/bin/ffmpeg`
+- Port local ffmpeg : `5588` par défaut
 - User-Agent : vide sauf si nécessaire
-- Jeton d'accès interface web : optionnel, mais recommandé si votre box
-  est sur un réseau partagé (le port 8090 n'a pas d'authentification par
-  défaut). Une fois défini, ouvrez `http://IP_DE_LA_BOX:8090/?token=VOTRE_JETON`.
+- Jeton web : laisser vide pour que l'addon en génère automatiquement un, ou définir votre propre jeton
 
 ## Utilisation
 
-1. Lancez une chaîne TV depuis IPTV Simple Client
-2. Menu contextuel (bouton menu ou C sur la télécommande)
-3. Choisissez "Commentaire audio (chaine en cours)"
-4. Sélectionnez le commentaire dans la liste
-5. Attendez 2-3 secondes → le flux fusionné démarre
-6. Une notification affiche l'adresse web : http://IP_DE_LA_BOX:8090
+1. Lancez une chaîne TV depuis IPTV Simple Client.
+2. Ouvrez le menu contextuel.
+3. Choisissez **Commentaire audio (chaine en cours)**.
+4. Sélectionnez le commentaire audio.
+5. L'addon démarre ffmpeg puis remplace la lecture par le flux fusionné.
+6. Une notification affiche l'URL exacte de l'interface web.
 
 ### Interface web
 
-Ouvrez http://IP_DE_LA_BOX:8090 dans un navigateur :
+Le serveur essaie le port **8090**, puis **8091 à 8099** si le port précédent est déjà utilisé. Cela évite notamment le conflit avec l'interface web intégrée de Kodi.
 
-- **Live** : réglage offset, volume, stop
+L'URL affichée par Kodi ressemble à :
+
+    http://IP_DE_LA_BOX:8091/?token=...
+
+Le port réel peut donc être différent de 8090.
+
+L'interface permet :
+
+- **Live** : offset, volume, stop et état ffmpeg
 - **Chaînes** : changement de chaîne à la volée
-- **Audios** : changement de commentaire à la volée
-- **Presets** : sauvegarde/chargement de combinaisons
-- **Logs** : dernières lignes ffmpeg
+- **Audios** : changement de commentaire
+- **Presets** : sauvegarde, chargement et suppression
+- **Logs** : consultation des dernières lignes ffmpeg
 
-## Limitations connues
+## Sécurité
 
-- Un seul client à la fois (option -listen 1 de ffmpeg)
-- Dérive possible sur de très longues sessions
-- Nécessite ffmpeg
+L'interface web est protégée par un jeton. Si aucun jeton n'est configuré dans les paramètres, un jeton aléatoire est généré et conservé dans le profil de l'addon.
+
+Les requêtes de commande sont validées :
+
+- offset limité à ±60000 ms
+- volume limité à 0–200 %
+- taille des POST limitée
+- nombre de lignes de logs limité
+- actions HTTP limitées à la liste prévue par l'addon
+- presets protégés contre les écritures concurrentes
+
+Ne partagez pas l'URL contenant le jeton avec des personnes non autorisées.
+
+## Point important : ffmpeg `-listen 1`
+
+L'addon **ne se connecte jamais au port ffmpeg pour vérifier qu'il est ouvert**.
+
+C'est volontaire : ffmpeg utilise `-listen 1`, donc une connexion de test pourrait consommer l'unique connexion disponible avant que Kodi ne lise le flux.
+
+La disponibilité est vérifiée via `/proc/net/tcp`, `/proc/net/tcp6` ou `ss` sans ouvrir de connexion TCP.
 
 ## Dépannage
 
-### "ffmpeg a quitté immédiatement"
+### Le site web ne s'ouvre plus
 
-Vérifiez le chemin :
+Regardez la notification Kodi : le port peut avoir basculé de 8090 vers 8091–8099.
+
+Sur la box :
+
+    netstat -tlnp | grep -E "8090|8091|8092|8093|8094|8095|8096|8097|8098|8099"
+
+### ffmpeg ne démarre pas
 
     which ffmpeg
+    netstat -tln | grep 5588
 
-### "ffmpeg n'ouvre pas le port"
+L'addon peut choisir automatiquement un port voisin si 5588 est déjà occupé.
 
-Tue les anciens ffmpeg :
+### ffmpeg quitte immédiatement
 
-    pkill -9 -f ffmpeg
-    netstat -tln | grep 5589
+Consultez :
 
-### Écran noir, Kodi timeout
+    tail -f /storage/.kodi/userdata/addon_data/script.tvaudiosync/ffmpeg.log
 
-Vérifiez que l'URL audio renvoie bien un flux audio :
+### Écran noir / timeout Kodi
 
-    curl -sIL 'http://votre-url-audio' | grep -i content-type
+Vérifiez que l'URL vidéo et l'URL audio renvoient bien les flux attendus. Un endpoint HTML à la place d'un flux média provoquera l'échec de ffmpeg.
 
-Si vous voyez text/html, l'URL est mauvaise.
-
-### Logs
+### Logs Kodi
 
     tail -f /storage/.kodi/temp/kodi.log
-    tail -f /storage/.kodi/userdata/addon_data/script.tvaudiosync/ffmpeg.log
 
 ## Licence
 
