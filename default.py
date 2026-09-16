@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 import os
 import time
-import socket
 import signal
 import subprocess
+import binascii
+import unicodedata
 
 import xbmc
 import xbmcgui
@@ -33,22 +34,27 @@ PID_FILE = os.path.join(PROFILE_DIR, 'ffmpeg.pid')
 OFFSET_FILE = os.path.join(PROFILE_DIR, 'offset.txt')
 LOG_FILE = os.path.join(PROFILE_DIR, 'ffmpeg.log')
 PRESETS_FILE = os.path.join(PROFILE_DIR, 'presets.json')
+WEB_TOKEN_FILE = os.path.join(PROFILE_DIR, 'web.token')
 
 WEB_PORT = 8090
+WEB_PORT_MAX = 8099
+FFMPEG_PORT_DEFAULT = 5588
 STEP_MS = 100
 STEP_MS_BIG = 500
 OFFSET_LIMIT_MS = 60000
+MAX_M3U_ENTRIES = 10000
+MAX_NAME_LEN = 512
 
-# xbmc.LOGNOTICE a ete retire des versions recentes de Kodi (remplace par
-# LOGINFO). On calcule le niveau une seule fois pour rester compatible
-# Kodi 18 -> Kodi 21+.
 _LOG_LEVEL = getattr(xbmc, 'LOGINFO', None)
 if _LOG_LEVEL is None:
     _LOG_LEVEL = getattr(xbmc, 'LOGNOTICE', 2)
 
 
 def log(msg):
-    xbmc.log('[{0}] {1}'.format(ADDON_ID, msg), level=_LOG_LEVEL)
+    try:
+        xbmc.log('[{0}] {1}'.format(ADDON_ID, msg), level=_LOG_LEVEL)
+    except Exception:
+        pass
 
 
 def clamp(value, lo, hi, default=0):
@@ -67,15 +73,22 @@ def notify(msg, error=False, time_ms=3500):
 def normalize(s):
     if not s:
         return u''
-    s = s.lower().strip()
-    for old, new in [(u'\u00e9', 'e'), (u'\u00e8', 'e'), (u'\u00ea', 'e'),
-                     (u'\u00e0', 'a'), (u'\u00e2', 'a'), (u'\u00ee', 'i'),
-                     (u'\u00ef', 'i'), (u'\u00f4', 'o'), (u'\u00fb', 'u'),
-                     (u'\u00f9', 'u'), (u'\u00e7', 'c')]:
-        s = s.replace(old, new)
-    for suffix in [u' hd', u' fhd', u' uhd', u' 4k', u' sd', u' hd+']:
+    try:
+        if not isinstance(s, unicode):
+            s = s.decode('utf-8', 'ignore')
+    except NameError:
+        if isinstance(s, bytes):
+            s = s.decode('utf-8', 'ignore')
+    s = s.strip().lower()
+    try:
+        s = unicodedata.normalize('NFKD', s)
+        s = u''.join(c for c in s if not unicodedata.combining(c))
+    except Exception:
+        pass
+    for suffix in [u' hd+', u' fhd', u' uhd', u' 4k', u' hd', u' sd']:
         if s.endswith(suffix):
             s = s[:-len(suffix)]
+            break
     return u' '.join(s.split())
 
 
@@ -101,10 +114,14 @@ def parse_m3u(path):
             continue
         if line.startswith('#EXTINF'):
             parts = line.split(',', 1)
-            title = parts[1].strip() if len(parts) > 1 else u'Sans nom'
+            title = (parts[1].strip() if len(parts) > 1 else u'Sans nom')[:MAX_NAME_LEN]
         elif not line.startswith('#'):
-            entries.append((line, title or line))
+            url = line[:4096]
+            entries.append((url, (title or url)[:MAX_NAME_LEN]))
             title = None
+            if len(entries) >= MAX_M3U_ENTRIES:
+                log('Playlist limitee a {0} entrees'.format(MAX_M3U_ENTRIES))
+                break
     return entries
 
 
@@ -112,20 +129,20 @@ def find_url_by_name(entries, name):
     if not name:
         return None
     target = normalize(name)
+    exact = []
     for url, title in entries:
-        if normalize(title) == target:
-            return url
-    # Correspondance approchee (accents/suffixe deja geres par normalize) :
-    # on ne l'accepte que si un seul candidat correspond, pour eviter de
-    # confondre par exemple "France 2" et "France 24".
+        if normalize(title) == target and url not in exact:
+            exact.append(url)
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None
     candidates = []
     for url, title in entries:
         t = normalize(title)
-        if t and (target in t or t in target):
+        if t and (target in t or t in target) and url not in candidates:
             candidates.append(url)
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def name_by_url(entries, url):
@@ -138,11 +155,10 @@ def name_by_url(entries, url):
 def get_current_channel_name():
     if not xbmc.getCondVisibility('Pvr.IsPlayingTv'):
         return None
-    for label in ('VideoPlayer.ChannelName', 'ListItem.ChannelName',
-                  'Player.ChannelName'):
-        v = xbmc.getInfoLabel(label)
-        if v:
-            return v
+    for label in ('VideoPlayer.ChannelName', 'ListItem.ChannelName', 'Player.ChannelName'):
+        value = xbmc.getInfoLabel(label)
+        if value:
+            return value
     return None
 
 
@@ -150,8 +166,7 @@ def get_current_video_url(video_entries):
     name = get_current_channel_name()
     if not name:
         return None, None
-    url = find_url_by_name(video_entries, name)
-    return url, name
+    return find_url_by_name(video_entries, name), name
 
 
 def choose_video_manually(video_entries):
@@ -179,9 +194,10 @@ def choose_audio(audio_entries):
 def read_offset():
     try:
         f = xbmcvfs.File(OFFSET_FILE, 'r')
-        v = f.read()
-        f.close()
-        return int(v)
+        try:
+            return clamp(f.read(), -OFFSET_LIMIT_MS, OFFSET_LIMIT_MS)
+        finally:
+            f.close()
     except Exception:
         return 0
 
@@ -189,8 +205,10 @@ def read_offset():
 def write_offset(ms):
     try:
         f = xbmcvfs.File(OFFSET_FILE, 'w')
-        f.write(str(int(ms)))
-        f.close()
+        try:
+            f.write(str(clamp(ms, -OFFSET_LIMIT_MS, OFFSET_LIMIT_MS)))
+        finally:
+            f.close()
     except Exception:
         pass
 
@@ -198,15 +216,33 @@ def write_offset(ms):
 def read_pid():
     try:
         f = xbmcvfs.File(PID_FILE, 'r')
-        v = f.read()
-        f.close()
-        return int(v)
+        try:
+            return int(f.read())
+        finally:
+            f.close()
     except Exception:
         return None
 
 
-def is_pid_alive(pid):
+def _proc_cmdline(pid):
+    try:
+        f = open('/proc/{0}/cmdline'.format(int(pid)), 'rb')
+        try:
+            return f.read().replace(b'\x00', b' ')
+        finally:
+            f.close()
+    except Exception:
+        return b''
+
+
+def is_ffmpeg_pid(pid):
     if not pid:
+        return False
+    return b'ffmpeg' in _proc_cmdline(pid).lower()
+
+
+def is_pid_alive(pid):
+    if not pid or not is_ffmpeg_pid(pid):
         return False
     try:
         os.kill(pid, 0)
@@ -217,45 +253,92 @@ def is_pid_alive(pid):
 
 def kill_previous_ffmpeg():
     pid = read_pid()
-    if pid:
+    if not pid or not is_ffmpeg_pid(pid):
         try:
-            os.kill(pid, signal.SIGTERM)
-            deadline = time.time() + 2.0
-            while time.time() < deadline and is_pid_alive(pid):
-                time.sleep(0.1)
-            if is_pid_alive(pid):
-                os.kill(pid, signal.SIGKILL)
-        except OSError:
+            xbmcvfs.delete(PID_FILE)
+        except Exception:
             pass
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.time() + 3.0
+        while time.time() < deadline and is_pid_alive(pid):
+            time.sleep(0.1)
+        if is_pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    except OSError:
+        pass
     try:
         xbmcvfs.delete(PID_FILE)
     except Exception:
         pass
 
 
-def wait_port_open(port, timeout=15):
-    # NE PAS se connecter au port : ffmpeg avec -listen 1 n'accepte
-    # qu'UNE seule connexion (celle de Kodi). Tester le port en s'y
-    # connectant consommerait cette connexion et ferait quitter ffmpeg.
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+def _proc_port_listening(port):
+    needle = '{0:04X}'.format(int(port)).upper()
+    for path in ('/proc/net/tcp', '/proc/net/tcp6'):
         try:
-            out = subprocess.check_output(
-                ['netstat', '-tln'], stderr=subprocess.STDOUT)
-            if isinstance(out, bytes):
-                out = out.decode('utf-8', 'ignore')
-            if ':{0} '.format(port) in out:
-                return True
+            f = open(path, 'r')
+            try:
+                for line in f.readlines()[1:]:
+                    fields = line.split()
+                    if len(fields) >= 4:
+                        local = fields[1]
+                        state = fields[3]
+                        if local.rsplit(':', 1)[-1].upper() == needle and state == '0A':
+                            return True
+            finally:
+                f.close()
         except Exception:
             pass
-        time.sleep(0.3)
     return False
+
+
+def _ss_port_listening(port):
+    try:
+        out = subprocess.check_output(['ss', '-ltn'], stderr=subprocess.STDOUT)
+        if isinstance(out, bytes):
+            out = out.decode('utf-8', 'ignore')
+        for line in out.splitlines():
+            if 'LISTEN' in line and (':{0} '.format(port) in line or line.rstrip().endswith(':{0}'.format(port))):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def port_listening(port):
+    return _proc_port_listening(port) or _ss_port_listening(port)
+
+
+def wait_port_open(port, timeout=15):
+    # CRITIQUE : ne jamais ouvrir de connexion TCP ici. ffmpeg utilise
+    # -listen 1 et la premiere connexion disponible est reservee a Kodi.
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if port_listening(port):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def choose_ffmpeg_port(preferred):
+    preferred = clamp(preferred, 1024, 65535, FFMPEG_PORT_DEFAULT)
+    candidates = [preferred]
+    for port in range(preferred + 1, min(preferred + 11, 65535)):
+        candidates.append(port)
+    for port in candidates:
+        if not port_listening(port):
+            return port
+    return preferred
 
 
 def build_cmd(ffmpeg, video_url, audio_url, offset_ms, port, ua, volume):
     ua_opt = ['-user_agent', ua] if ua else []
-    recon = ['-reconnect', '1', '-reconnect_streamed', '1',
-             '-reconnect_delay_max', '5']
+    recon = ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5']
     voff = []
     aoff = []
     if offset_ms > 0:
@@ -265,69 +348,64 @@ def build_cmd(ffmpeg, video_url, audio_url, offset_ms, port, ua, volume):
     cmd = [ffmpeg, '-nostdin', '-hide_banner', '-loglevel', 'warning']
     cmd += ua_opt + recon + voff + ['-i', video_url]
     cmd += ua_opt + recon + aoff + ['-i', audio_url]
-    cmd += [
-        '-map', '0:v:0',
-        '-map', '1:a:0',
-        '-c:v', 'copy',
-        '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
-    ]
+    cmd += ['-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac',
+            '-b:a', '128k', '-ac', '2']
     if int(volume) != 100:
         cmd += ['-af', 'volume={0}'.format(float(volume) / 100.0)]
-    cmd += [
-        '-f', 'mpegts',
-        '-listen', '1',
-        'http://127.0.0.1:{0}/live.ts'.format(port),
-    ]
+    cmd += ['-f', 'mpegts', '-listen', '1',
+            'http://127.0.0.1:{0}/live.ts'.format(port)]
     return cmd
+
+
+def _start_one_ffmpeg(ffmpeg, video_url, audio_url, offset_ms, volume, port, ua):
+    cmd = build_cmd(ffmpeg, video_url, audio_url, offset_ms, port, ua, volume)
+    log('Lancement ffmpeg sur 127.0.0.1:{0}'.format(port))
+    try:
+        logf = open(LOG_FILE, 'ab')
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf,
+                                preexec_fn=os.setsid, close_fds=True)
+        logf.close()
+    except Exception as exc:
+        log('Popen ffmpeg echoue: {0}'.format(exc))
+        return None
+    try:
+        pf = xbmcvfs.File(PID_FILE, 'w')
+        try:
+            pf.write(str(proc.pid))
+        finally:
+            pf.close()
+    except Exception:
+        pass
+    time.sleep(0.7)
+    if proc.poll() is not None:
+        return None
+    if not wait_port_open(port, timeout=12):
+        log('Port ffmpeg {0} non detecte'.format(port))
+        kill_previous_ffmpeg()
+        return None
+    return proc
 
 
 def start_ffmpeg(video_url, audio_url, offset_ms, volume=100):
     ffmpeg = ADDON.getSetting('ffmpeg_path') or '/opt/bin/ffmpeg'
     try:
-        port = int(ADDON.getSetting('http_port') or '5588')
-    except ValueError:
-        port = 5588
+        preferred = int(ADDON.getSetting('http_port') or str(FFMPEG_PORT_DEFAULT))
+    except (TypeError, ValueError):
+        preferred = FFMPEG_PORT_DEFAULT
     ua = ADDON.getSetting('user_agent') or ''
 
-    if not xbmcvfs.exists(ffmpeg):
+    if not (os.path.isfile(ffmpeg) or xbmcvfs.exists(ffmpeg)):
         notify(u'ffmpeg introuvable: ' + ffmpeg, error=True)
         return None
 
     kill_previous_ffmpeg()
-    time.sleep(0.5)
-
-    cmd = build_cmd(ffmpeg, video_url, audio_url, offset_ms, port, ua, volume)
-    log('Lancement: {0}'.format(' '.join(cmd)))
-
-    try:
-        with open(LOG_FILE, 'wb'):
-            pass
-        logf = open(LOG_FILE, 'ab')
-        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf,
-                                preexec_fn=os.setsid, close_fds=True)
-    except Exception as exc:
-        notify(u'Echec lancement ffmpeg', error=True)
-        log('Popen echoue: {0}'.format(exc))
+    time.sleep(0.2)
+    port = choose_ffmpeg_port(preferred)
+    proc = _start_one_ffmpeg(ffmpeg, video_url, audio_url, offset_ms, volume, port, ua)
+    if not proc:
         return None
-
-    try:
-        pf = xbmcvfs.File(PID_FILE, 'w')
-        pf.write(str(proc.pid))
-        pf.close()
-    except Exception:
-        pass
-
-    time.sleep(1.0)
-    if proc.poll() is not None:
-        notify(u'ffmpeg a quitte immediatement', error=True)
-        return None
-
-    if not wait_port_open(port, timeout=12):
-        notify(u"ffmpeg n'ouvre pas le port {0}".format(port), error=True)
-        kill_previous_ffmpeg()
-        return None
-
     write_offset(offset_ms)
+    webserver.update_state(ffmpeg_pid=proc.pid, ffmpeg_port=port)
     return 'http://127.0.0.1:{0}/live.ts'.format(port)
 
 
@@ -345,24 +423,56 @@ def play(url):
 def apply_and_play(video_url, audio_url, offset, volume):
     m = start_ffmpeg(video_url, audio_url, offset, volume)
     if not m:
+        webserver.update_state(status='error', error='ffmpeg')
         return False
-    pid = read_pid()
-    webserver.update_state(ffmpeg_pid=pid or 0)
     play(m)
     xbmc.sleep(800)
-    webserver.update_state(status='running', offset=offset, volume=volume)
+    webserver.update_state(status='running', offset=offset, volume=volume, error='')
     return True
+
+
+def get_web_token():
+    configured = ADDON.getSetting('web_token') or ''
+    if configured:
+        return configured.strip()[:128]
+    try:
+        f = xbmcvfs.File(WEB_TOKEN_FILE, 'r')
+        try:
+            token = f.read().strip()
+        finally:
+            f.close()
+        if token:
+            return token
+    except Exception:
+        pass
+    token = binascii.hexlify(os.urandom(16)).decode('ascii')
+    try:
+        f = xbmcvfs.File(WEB_TOKEN_FILE, 'w')
+        try:
+            f.write(token)
+        finally:
+            f.close()
+    except Exception:
+        pass
+    return token
+
+
+def web_url():
+    port = webserver.get_port() or WEB_PORT
+    ip = xbmc.getIPAddress() or 'IP_DE_LA_BOX'
+    token = webserver.get_token()
+    return 'http://{0}:{1}/?token={2}'.format(ip, port, token)
 
 
 def main():
     video_entries = parse_m3u(ADDON.getSetting('video_m3u'))
     audio_entries = parse_m3u(ADDON.getSetting('audio_m3u'))
-    web_token = ADDON.getSetting('web_token') or ''
+    web_token = get_web_token()
 
     video_url, channel_name = get_current_video_url(video_entries)
     if not video_url:
         if channel_name:
-            notify(u"Chaine '{0}' introuvable".format(channel_name))
+            notify(u"Chaine '{0}' introuvable ou ambiguë".format(channel_name), error=True)
         video_url, channel_name = choose_video_manually(video_entries)
         if not video_url:
             return
@@ -374,29 +484,31 @@ def main():
 
     offset = read_offset()
     volume = 100
-
     q = Q.Queue()
+
     webserver.START_TIME = time.time()
     webserver.update_state(channel=channel_name or '', audio=audio_name or '',
-                           offset=offset, volume=volume,
-                           status='starting', ffmpeg_pid=0, error='')
-
-    webserver.start_server(
+                           offset=offset, volume=volume, status='starting',
+                           ffmpeg_pid=0, ffmpeg_port=0, error='')
+    server = webserver.start_server(
         command_queue=q,
         presets_file=PRESETS_FILE,
         log_file=LOG_FILE,
         channels=[t for _, t in video_entries],
         audios=[t for _, t in audio_entries],
-        port=WEB_PORT,
+        preferred_port=WEB_PORT,
+        max_port=WEB_PORT_MAX,
         web_token=web_token)
 
-    ip = xbmc.getIPAddress() or 'IP_DE_LA_BOX'
-    suffix = (u'?token=' + web_token) if web_token else u''
-    notify(u'Web: http://{0}:{1}{2}'.format(ip, WEB_PORT, suffix), time_ms=4000)
-    log('Interface web : http://{0}:{1}{2}'.format(ip, WEB_PORT, suffix))
+    if server is not None:
+        url = web_url()
+        notify(u'Web: ' + url, time_ms=5000)
+        log('Interface web active sur le port {0}'.format(webserver.get_port()))
+    else:
+        notify(u'Interface web indisponible; lecture maintenue', error=True)
+        log('Impossible de demarrer l interface web')
 
     if not apply_and_play(video_url, audio_url, offset, volume):
-        webserver.update_state(status='error')
         notify(u'Retour a la chaine TV', error=True)
         try:
             play(video_url)
@@ -410,81 +522,71 @@ def main():
 
     while not monitor.abortRequested():
         try:
-            c = q.get_nowait()
+            command = q.get_nowait()
         except Q.Empty:
-            c = None
+            command = None
 
-        if c:
-            action = c.get('action')
-            value = c.get('value')
+        if command:
+            action = command.get('action')
+            value = command.get('value')
 
             if action == 'stop':
                 break
-
-            if action == 'offset':
-                offset = clamp(offset + clamp(value, -OFFSET_LIMIT_MS, OFFSET_LIMIT_MS),
+            elif action == 'restart':
+                webserver.update_state(status='restarting')
+                apply_and_play(video_url, audio_url, offset, volume)
+            elif action == 'offset':
+                offset = clamp(offset + clamp(value, -STEP_MS_BIG, STEP_MS_BIG),
                                -OFFSET_LIMIT_MS, OFFSET_LIMIT_MS)
                 webserver.update_state(status='restarting')
                 apply_and_play(video_url, audio_url, offset, volume)
-
             elif action == 'set_offset':
                 offset = clamp(value, -OFFSET_LIMIT_MS, OFFSET_LIMIT_MS)
                 webserver.update_state(status='restarting')
                 apply_and_play(video_url, audio_url, offset, volume)
-
             elif action == 'reset':
                 offset = 0
                 webserver.update_state(status='restarting')
                 apply_and_play(video_url, audio_url, 0, volume)
-
             elif action == 'set_volume':
                 volume = clamp(value, 0, 200, default=100)
                 webserver.update_state(status='restarting')
                 apply_and_play(video_url, audio_url, offset, volume)
-
             elif action == 'switch_channel':
                 new_url = find_url_by_name(video_entries, value)
                 if new_url:
                     video_url = new_url
                     channel_name = value
-                    webserver.update_state(channel=channel_name,
-                                           status='restarting')
+                    webserver.update_state(channel=channel_name, status='restarting')
                     apply_and_play(video_url, audio_url, offset, volume)
-
             elif action == 'switch_audio':
                 new_url = find_url_by_name(audio_entries, value)
                 if new_url:
                     audio_url = new_url
                     audio_name = value
-                    webserver.update_state(audio=audio_name,
-                                           status='restarting')
+                    webserver.update_state(audio=audio_name, status='restarting')
                     apply_and_play(video_url, audio_url, offset, volume)
-
             elif action == 'load_preset':
                 p = value or {}
                 nv = find_url_by_name(video_entries, p.get('channel', ''))
                 na = find_url_by_name(audio_entries, p.get('audio', ''))
                 if nv and na:
-                    video_url = nv
-                    audio_url = na
-                    channel_name = p.get('channel', '')
-                    audio_name = p.get('audio', '')
+                    video_url, audio_url = nv, na
+                    channel_name, audio_name = p.get('channel', ''), p.get('audio', '')
                     offset = clamp(p.get('offset', 0), -OFFSET_LIMIT_MS, OFFSET_LIMIT_MS)
                     volume = clamp(p.get('volume', 100), 0, 200, default=100)
-                    webserver.update_state(channel=channel_name,
-                                           audio=audio_name,
-                                           offset=offset, volume=volume,
-                                           status='restarting')
+                    webserver.update_state(channel=channel_name, audio=audio_name,
+                                           offset=offset, volume=volume, status='restarting')
                     apply_and_play(video_url, audio_url, offset, volume)
 
-        # Reconnexion auto si ffmpeg est mort
-        if webserver.get_state().get('status') == 'running':
+        state = webserver.get_state()
+        if state.get('status') == 'running':
             pid = read_pid()
             if pid and not is_pid_alive(pid):
-                log('ffmpeg mort -> reconnexion auto')
-                webserver.update_state(status='reconnecting')
+                log('ffmpeg mort -> reconnexion automatique')
+                webserver.update_state(status='reconnecting', error='')
                 if not apply_and_play(video_url, audio_url, offset, volume):
-                    webserver.update_state(status='error')
+                    webserver.update_state(status='error', error='reconnexion ffmpeg impossible')
 
         if not player.isPlaying():
             break
